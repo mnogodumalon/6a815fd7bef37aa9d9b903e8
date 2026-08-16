@@ -1,0 +1,65 @@
+{
+  "AbteilungenDialog.tsx": {
+    "abteilungsname": "z. B. Finanzen, IT, Vertrieb",
+    "abteilungscode": "z. B. FIN-001",
+    "beschreibung": "Aufgaben, Verantwortungen, Besonderheiten...",
+    "leiter_vorname": "z. B. Max",
+    "leiter_nachname": "z. B. Müller",
+    "standort": "z. B. Berlin Mitte",
+    "kostenstelle": "z. B. 4100-01"
+  },
+  "StellenDialog.tsx": {
+    "stellenbezeichnung": "z. B. Senior Developer, Teamlead",
+    "stellencode": "z. B. STE-001",
+    "abteilung": "Abteilung wählen",
+    "beschaeftigungsart": "z. B. Vollzeit, Teilzeit",
+    "senioritaet": "z. B. Junior, Senior",
+    "aufgaben": "Aufgabenbereich, Verantwortungen, Projekte...",
+    "qualifikationen": "Erforderliche Fachkenntnisse, Erfahrung, Sprachen..."
+  },
+  "MitarbeitendeDialog.tsx": {
+    "vorname": "z. B. Maria",
+    "nachname": "z. B. Schmidt",
+    "personalnummer": "z. B. MA-2026-001",
+    "geburtsdatum": "Wann ist der Geburtstag?",
+    "geschlecht": "z. B. Weiblich, Männlich",
+    "nationalitaet": "z. B. Deutsch, Italienisch",
+    "email": "z. B. maria@example.com",
+    "telefon": "z. B. +49 30 1234567",
+    "strasse": "z. B. Hauptstraße",
+    "hausnummer": "z. B. 42",
+    "postleitzahl": "z. B. 10115",
+    "ort": "z. B. Berlin",
+    "eintrittsdatum": "Wann tritt die Person ein?",
+    "beschaeftigungsart": "z. B. Vollzeit, Teilzeit",
+    "abteilung": "Abteilung zuweisen",
+    "stelle": "Stelle zuweisen",
+    "notfall_vorname": "z. B. Klaus",
+    "notfall_nachname": "z. B. Meyer",
+    "notfall_telefon": "z. B. +49 30 7654321",
+    "iban": "z. B. DE75512108001234567890",
+    "notizen": "Spezielle Informationen, Allergien, Besonderheiten..."
+  },
+  "AbwesenheitenDialog.tsx": {
+    "mitarbeiter": "Mitarbeitende Person wählen",
+    "abwesenheitstyp": "z. B. Urlaub, Krankheit",
+    "startdatum": "Wann beginnt die Abwesenheit?",
+    "enddatum": "Wann endet die Abwesenheit?",
+    "anzahl_tage": "Berechnet automatisch",
+    "status": "z. B. Beantragt, Genehmigt",
+    "grund": "Grund, Anmerkungen, Anrechnung..."
+  },
+  "LeistungsbeurteilungenDialog.tsx": {
+    "mitarbeiter": "Mitarbeitende Person wählen",
+    "beurteilungszeitraum": "z. B. Q1, Jährlich",
+    "beurteilungsdatum": "Wann ist die Beurteilung?",
+    "beurteiler_vorname": "z. B. Thomas",
+    "beurteiler_nachname": "z. B. Wagner",
+    "gesamtbewertung": "z. B. Gut, Hervorragend",
+    "ziele_erreicht": "Welche Ziele wurden erreicht?",
+    "staerken": "Besondere Stärken, Erfolge...",
+    "verbesserungsbereiche": "Wo gibt es Entwicklungspotenzial?",
+    "entwicklungsplan": "Maßnahmen, Trainings, Ziele...",
+    "mitarbeiter_kommentar": "Anmerkungen, Ergänzungen, Rückmeldung..."
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "entities": {
+    "Abteilungen": {
+      "placeholders_set": 7,
+      "defaults_keys": [],
+      "computed_keys": [],
+      "reason": "Reine Stammdaten (Name, Code, Beschreibung, Leitung, Standort). Keine Number-Felder, keine Datumsbereiche, keine berechenbaren Größen."
+    },
+    "Stellen": {
+      "placeholders_set": 7,
+      "defaults_keys": ["beschaeftigungsart"],
+      "computed_keys": [],
+      "reason": "Stammdaten mit Beschäftigungsart- und Senioritäts-Lookups, applookup auf Abteilungen (nur Referenz). Keine Preise oder Mengen berechenbar."
+    },
+    "Mitarbeitende": {
+      "placeholders_set": 24,
+      "defaults_keys": ["eintrittsdatum", "beschaeftigungsart"],
+      "computed_keys": [],
+      "reason": "Stammdaten mit Adresse, Kontakt, Eintrittsdatum, applookups auf Abteilungen/Stellen. Keine Number-Felder für Berechnungen, keine Preis-Multiplikationen."
+    },
+    "Abwesenheiten": {
+      "placeholders_set": 8,
+      "defaults_keys": ["startdatum", "enddatum", "status"],
+      "computed_keys": ["anzahl_tage", "_abwesenheit_dauer_tage"],
+      "reason": "Datumspaar (startdatum/enddatum) mit echtem anzahl_tage-Feld + virtueller Dauer-Key für Aggregat-Anzeige. PFLICHT-Heuristik: zwei Datumsfelder als Paar erfordern dateDiff-Berechnung in computed (a.1 + a.2)."
+    },
+    "Leistungsbeurteilungen": {
+      "placeholders_set": 10,
+      "defaults_keys": ["beurteilungsdatum", "gesamtbewertung"],
+      "computed_keys": [],
+      "reason": "Stammdaten zur Leistungsbewertung mit Text-Feldern und Lookup-Feldern. Beurteilungsdatum als Erfassungsdatum mit today-Default. Keine berechenbaren numerischen Größen, keine applookup-Ketten für Berechnungen."
+    }
+  }
+}

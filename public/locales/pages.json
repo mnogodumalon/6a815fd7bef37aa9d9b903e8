@@ -1,0 +1,32 @@
+{
+  "pages": {
+    "en": {
+      "Abw.": "Abs.",
+      "Abwesend": "Absent",
+      "Abwesenheit erfassen": "Log Absence",
+      "Abwesenheit genehmigen": "Approve Absence",
+      "Abwesenheitsanträge": "Absence Requests",
+      "Abwesenheitstypen": "Absence Types",
+      "Alle": "All",
+      "Erste:n Mitarbeiter:in anlegen": "Create First Employee",
+      "Genehmigen": "Approve",
+      "HR-Dashboard": "HR Dashboard",
+      "Heute abwesend": "Absent Today",
+      "Keine Mitarbeitenden gefunden.": "No Employees Found.",
+      "Keine offenen Anträge — alles genehmigt.": "No Open Requests — All Approved.",
+      "Mitarbeiter:in anlegen": "Create Employee",
+      "Name, E-Mail, Abteilung …": "Name, Email, Department …",
+      "Noch keine Mitarbeitenden angelegt.": "No Employees Created Yet.",
+      "Offen zur Genehmigung": "Pending Approval",
+      "Typ": "Type",
+      "Unbekannt": "Unknown",
+      "haben offene Abwesenheitsanträge.": "have open absence requests.",
+      "hat einen offenen Abwesenheitsantrag.": "has an open absence request.",
+      "{0} Alle {1} Mitarbeitenden im Überblick.": "{0} All {1} Employees at a Glance.",
+      "{0} Heute abwesend: {1}.": "{0} Absent Today: {1}.",
+      "{0} {1} Abwesenheitsanträge warten auf Genehmigung.": "{0} {1} Absence Requests Pending Approval.",
+      "{0} — Abwesenheit genehmigt": "{0} — Absence Approved"
+    }
+  },
+  "v": 1
+}
