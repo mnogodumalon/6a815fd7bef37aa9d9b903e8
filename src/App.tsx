@@ -21,6 +21,8 @@ import AbwesenheitenDetailPage from '@/pages/AbwesenheitenDetailPage';
 import LeistungsbeurteilungenPage from '@/pages/LeistungsbeurteilungenPage';
 import LeistungsbeurteilungenDetailPage from '@/pages/LeistungsbeurteilungenDetailPage';
 // <custom:imports>
+const MitarbeiterOnboardingPage = lazy(() => import('@/pages/intents/MitarbeiterOnboardingPage'));
+const LeistungsbeurteilungsrundePage = lazy(() => import('@/pages/intents/LeistungsbeurteilungsrundePage'));
 // </custom:imports>
 
 // Lazy: public pages live outside <Layout> and only load on /#/public/:slug —
@@ -73,6 +75,8 @@ export default function App() {
                 <Route path="admin" element={<AdminPage />} />
                 <Route path="verwaltung/oeffentliche-seiten" element={<PublicPagesAdmin />} />
                 {/* <custom:routes> */}
+                <Route path="intents/mitarbeiter-onboarding" element={<Suspense fallback={null}><MitarbeiterOnboardingPage /></Suspense>} />
+                <Route path="intents/leistungsbeurteilungsrunde" element={<Suspense fallback={null}><LeistungsbeurteilungsrundePage /></Suspense>} />
                 {/* </custom:routes> */}
               </Route>
             </Routes>
