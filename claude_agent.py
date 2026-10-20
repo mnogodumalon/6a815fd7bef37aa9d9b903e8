@@ -1,26 +1,11 @@
 import asyncio
-import dataclasses
 import json
 import time
-from contextlib import aclosing
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition, AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock, TextBlock, ResultMessage, HookMatcher, create_sdk_mcp_server, tool
-from claude_agent_sdk import query as sdk_query
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition, AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock, TextBlock, ResultMessage, HookMatcher
 import os
 
 _t0 = time.time()
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "warn").lower()
-
-# One source of truth — the orchestrator and the intent-page sessions it fans
-# out to must run the same model.
-AGENT_MODEL = "claude-sonnet-4-6"
-
-def _actor_fields(parent_tool_use_id: str | None) -> dict:
-    """Build actor/parent_id pair used to distinguish main-agent from sub-agent frames."""
-    return {
-        "actor": "subagent" if parent_tool_use_id else "main",
-        "parent_id": parent_tool_use_id,
-    }
-
 
 async def _on_post_tool_use(input_data: dict, tool_use_id: str | None = None, context: dict | None = None) -> dict:
     """Log tool results after execution (only at debug level)."""
@@ -30,103 +15,24 @@ async def _on_post_tool_use(input_data: dict, tool_use_id: str | None = None, co
             response = input_data.get("tool_response", "")
             output = str(response)[:4000] if response else ""
             elapsed = round(time.time() - _t0, 1)
-            parent = input_data.get("parent_tool_use_id") or input_data.get("agent_id")
-            print(json.dumps({"type": "tool_result", "tool": tool, "output": output, "t": elapsed, **_actor_fields(parent)}), flush=True)
+            print(json.dumps({"type": "tool_result", "tool": tool, "output": output, "t": elapsed}), flush=True)
         except Exception as e:
             elapsed = round(time.time() - _t0, 1)
             print(json.dumps({"type": "tool_result", "tool": input_data.get("tool_name", "?"), "output": f"[hook error: {e}]", "t": elapsed}), flush=True)
     return {"continue_": True}
 
-
-# Files the main agent must NOT read — they belong exclusively to the form-polish sub-agent.
-# Defense-in-depth alongside the form_polish AgentDefinition: even with the prompt
-# moved inline, .placeholder-tasks.json still lives on disk as the sub-agent's
-# trigger/task-list. If the main agent reads it, it decides the instructions
-# apply to itself and duplicates the form-polish edits. Discriminator: sub-agent
-# tool_use_data has a non-empty `agent_id` string; main-agent's is absent or empty.
-_SUBAGENT_ONLY_FILES = (".placeholder-tasks.json",)
-
-async def _block_subagent_files_for_main_agent(input_data: dict, tool_use_id: str | None = None, context: dict | None = None) -> dict:
-    """Deny main-agent Read on files reserved for the form-polish sub-agent."""
-    file_path = input_data.get("tool_input", {}).get("file_path", "") or ""
-    if not any(marker in file_path for marker in _SUBAGENT_ONLY_FILES):
-        return {}
-
-    agent_id = input_data.get("agent_id")
-    parent_tool_use_id = input_data.get("parent_tool_use_id")
-    is_subagent = bool(
-        (isinstance(agent_id, str) and agent_id)
-        or (isinstance(parent_tool_use_id, str) and parent_tool_use_id)
-    )
-    if is_subagent:
-        return {}
-
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "Diese Datei gehört dem Form-Polish Sub-Agent. "
-                "Du hast ihn bereits dispatched — gehe direkt zu Step 1 (Dashboard) "
-                "und bearbeite KEINE Form-Dateien (Dialoge, form-enhancements/*.ts, Reports)."
-            ),
-        }
-    }
-
-async def _deny_serial_intent_dispatch(input_data: dict, tool_use_id: str | None = None, context: dict | None = None) -> dict:
-    """Close the serial path: `intent_builder` is not dispatchable any more.
-
-    Matched on every tool rather than on a tool name, because the subagent-
-    dispatch tool has been called both `Task` and `Agent` across CLI versions —
-    the discriminator that actually holds is the `subagent_type` argument.
-    """
-    tool_input = input_data.get("tool_input", {}) or {}
-    if tool_input.get("subagent_type") != "intent_builder":
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "'intent_builder' is not a subagent any more — dispatching per flow made the "
-                "build cost the SUM of all pages. Call the tool build_intent_pages ONCE with "
-                "every flow in its `flows` array instead; they run concurrently."
-            ),
-        }
-    }
-
-
 # Environment-specific configuration
 LA_API_URL = os.getenv("LA_API_URL", "https://my.living-apps.de/rest")
 LA_FRONTEND_URL = os.getenv("LA_FRONTEND_URL", "https://my.living-apps.de")
 
-# Explicit dashboard language set by the host (get_agent_command). Default
-# stays German — same behavior as before the language feature.
-UI_LANGUAGE = os.getenv("LANGUAGE", "de")
-_UI_LANGUAGE_NAMES = {"de": "German", "en": "English"}
-UI_LANGUAGE_NAME = _UI_LANGUAGE_NAMES.get(UI_LANGUAGE, "German")
-_TONE_RULE = (
-    ' Always use "du/dein/dir" — NEVER "Sie/Ihr/Ihnen".' if UI_LANGUAGE == "de" else ""
-)
-
 # ── Subagent prompts (only used in Phase 2 / "all" mode) ───────────
 
-INTENT_BUILDER_PROMPT = (
-    "You build a single INTENT UI page — a task-oriented workflow that guides the user "
-    "through a multi-step process.\n"
-    "\n"
-    # The prompt body below is a plain literal — it is full of JSX braces, so
-    # only this language block may interpolate.
-    f"LANGUAGE & TONE: Communicate in {UI_LANGUAGE_NAME}.{_TONE_RULE}\n"
-    "UI TEXT (multilingual): the dashboard has a runtime language switcher (core locales de/en, "
-    "more added later as overlays). Every UI string you write (labels, buttons, headings, "
-    "descriptions, empty states, tooltips) is written ONCE in the build language and MARKED "
-    "with tx from '@/i18n': {tx('Termin wählen')}, label: tx('Bearbeiten'), and the tagged "
-    "form tx`${n} offene Aufträge` for interpolation. The pipeline generates all translations "
-    "after the build — NEVER write translations or makeT tables yourself. tx at module scope "
-    "freezes one language — call it inside the component body. Scaffold text via "
-    "t()/appLabel()/fieldLabel()/lookupLabel(). check-intents flags unmarked strings.\n"
-    """
+INTENT_BUILDER_PROMPT = """\
+You build a single INTENT UI page — a task-oriented workflow that guides the user through a multi-step process.
+
+LANGUAGE & TONE: All UI text (labels, buttons, headings, descriptions, empty states, tooltips) MUST be in German. \
+Always use "du/dein/dir" — NEVER "Sie/Ihr/Ihnen".
+
 ## WHAT AN INTENT UI IS (vs what it is NOT)
 
 An intent UI is NOT a fancy CRUD page. CRUD pages already exist for every entity — they have tables, search, \
@@ -157,41 +63,32 @@ Use useState to manage wizard steps, selections, and running totals.
 
 RECORD CREATION & SELECTION — THIS IS THE #1 RULE:
 
-🚨 NEVER use the pre-generated {Entity}Dialog inside an intent UI — not as a step, not behind \
-"Neu erstellen". It is the generic CRUD modal (every field, photo scan) and defeats the wizard: \
-the user came here to be guided, not to face the full form. Build a task-tailored mini-form \
-instead — only the 2–4 fields that matter for this step's decision — and call \
-LivingAppsService.create<X>Entry() directly with correctly formatted values (see the API rules \
-below; scripts/check-lookup-keys.mjs catches invented lookup keys before the build).
+🚨 NEVER build custom inline forms for creating records. NEVER. Not even "simple" ones.
+The pre-generated {Entity}Dialog handles ALL field types, validation, photo scan, applookup fields, \
+and lookup enrichment correctly. A custom inline form will be WRONG.
 
 For EVERY step where the user needs to pick or add a record:
 
 1. SHOW EXISTING RECORDS FIRST — fetch from useDashboardData(), display as a searchable list \
 (use EntitySelectStep or a custom card list). The user picks from what already exists.
 
-2. OFFER "Neu erstellen" — a button that reveals YOUR OWN mini-form (inline panel or a small \
-Dialog composed from ui/ primitives). After a successful create and fetchAll(), auto-select \
-the newly created record.
+2. OFFER "Neu erstellen" BUTTON — a Button below or beside the list that opens {Entity}Dialog. \
+After the dialog closes successfully and fetchAll() refreshes, auto-select the newly created record.
 
 3. CONCRETE EXAMPLE:
 ```tsx
-const [showCreate, setShowCreate] = useState(false);
-const [name, setName] = useState('');
-<EntitySelectStep items={artikel.map(a => ({...}))} onSelect={handleSelect}
-  createLabel="Neuen Artikel anlegen" onCreateNew={() => setShowCreate(true)} />
-{showCreate && (
-  <div className="rounded-2xl border p-4 space-y-3">  {/* mini-form: ONLY this step's fields */}
-    <Input value={name} onChange={e => setName(e.target.value)} placeholder="Artikelname" />
-    <Button onClick={async () => {
-      await LivingAppsService.createArtikelEntry({ name });
-      await fetchAll(); setShowCreate(false);          // then auto-select the new record
-    }}>Anlegen</Button>
-  </div>
-)}
+const [dialogOpen, setDialogOpen] = useState(false);
+// Show existing articles to select from
+<EntitySelectStep items={artikel.map(a => ({...}))} onSelect={handleSelect} />
+<Button variant="outline" onClick={() => setDialogOpen(true)}>
+  <IconPlus size={16} className="mr-2" /> Neuen Artikel anlegen
+</Button>
+<ArtikelDialog open={dialogOpen} onClose={() => setDialogOpen(false)}
+  onSubmit={async (fields) => { await LivingAppsService.createArtikelEntry(fields); await fetchAll(); }} />
 ```
 
-This applies to ALL entities in EVERY step. The full CRUD form stays on the CRUD page — \
-fields not relevant to this step can be filled there later.
+This applies to ALL entities in EVERY step: selecting a group, picking participants, choosing articles, etc. \
+Never replace the dialog with an inline form — not even for "quick add" scenarios.
 
 MANDATORY RULES:
 - BEFORE writing any code, Read src/types/app.ts to learn the EXACT field names for each entity type. \
@@ -200,41 +97,20 @@ Use ONLY these field names when calling LivingAppsService methods. NEVER invent 
 from '@/services/livingAppsService'. Do NOT build custom API calls or service functions.
 - Create the file with Write tool — one shot, no read-back.
 - The file must be a valid React component with a default export.
-- The file MUST START with a /** … */ docblock (above the imports): purpose in one line, \
-the ordered steps, which entities it reads and writes, which shared components it composes. \
-Follow-up agent sessions read this block to find and reuse the flow (e.g. to mirror it as a \
-public page) — a page without it is invisible to them. Example:
-  /**
-   * Neue Buchung — 3-Schritt-Wizard.
-   * Steps: 1) Kurs wählen → 2) Teilnehmer erfassen → 3) Bestätigen & anlegen.
-   * Reads: kurse, teilnehmer. Writes: buchungen (createBuchungenEntry).
-   * Composes: IntentWizardShell, EntitySelectStep.
-   */
 - Import useDashboardData from '@/hooks/useDashboardData' for data access.
 - Import types from '@/types/app', services from '@/services/livingAppsService'.
 - Import enrichment functions from '@/lib/enrich' and enriched types from '@/types/enriched' if needed.
 - NEVER use Bash for file operations — use Read/Write/Edit tools only.
 - Rules of Hooks: ALL hooks MUST be BEFORE any early returns (loading/error).
 - IMPORT HYGIENE: Only import what you use.
-- NO toISOString() ANYWHERE in the file — not even for local display state that never reaches \
-the API. The check-intents gate is file-wide and context-free. Use date-fns format() instead.
-- No {Entity}Dialog — see THE #1 RULE above. Each step owns a tailored inline UI with the most \
-ergonomic input method (date-range picker, tile-style multi-select with prices, live total card, \
-search-as-you-type). Full examples: .claude/skills/intent-ui/SKILL.md section \
-"NEVER use the pre-generated {Entity}Dialog inside an intent UI".
+- ALWAYS reuse pre-generated {Entity}Dialog from '@/components/dialogs/{Entity}Dialog' for record creation/editing.
 - TOUCH-FRIENDLY: NEVER hide buttons behind hover.
-- MANDATORY FIRST STEP: Before writing any code, Read `.claude/skills/intent-ui/SKILL.md` \
-in full. It is the authoritative source for design patterns AND critical API write rules \
-(lookup keys, applookup URLs, multipleapplookup arrays). Skipping it produces wrong code.
+- Follow .claude/skills/intent-ui/SKILL.md for design patterns.
 - Do NOT run npm run build — the orchestrator handles that.
 - Do NOT touch any other files — only create the file you were given.
 - DEEP-LINKING: Use useSearchParams to read ?step= parameter. Initialize the wizard step from the URL \
 param so the dashboard can link directly to specific steps (e.g., ?eventId=xxx&step=2 skips to step 2). \
 When the user navigates between steps, update the URL params to keep them in sync.
-- NAVIGATION OUT: Never link the user from an intent UI to a CRUD subpage \
-(`#/buchungen`, `#/kunden`, `#/katzen`, …). Allowed link targets are ONLY: `#/` (dashboard) \
-or `#/intents/<other-slug>` (follow-up intent). On success, offer "Neue Buchung anlegen" \
-(reset wizard) and "Zurück zum Dashboard" — not "Zur Buchungsübersicht".
 
 CRITICAL API RULE — lookup fields when writing:
 When READING, lookups are objects: { key: 'x', label: 'X' }.
@@ -242,563 +118,9 @@ When WRITING (create/update via LivingAppsService), send ONLY the plain key stri
   ❌ status: { key: 'eingeladen', label: 'Eingeladen' }  → 400 error
   ✅ status: 'eingeladen'                                 → works
 For multiplelookup, send string array: ['a', 'b'], NOT [{key,label}, ...].
-
-CRITICAL API RULE — multipleapplookup fields when writing:
-The API expects null or an ARRAY of full record URLs (string[]). NEVER join, stringify,
-or send a single URL where a list is expected.
-  ✅ extras: ids.map(id => createRecordUrl(APP_IDS.X, id))   // string[]
-  ✅ extras: urls.length > 0 ? urls : undefined
-  ❌ extras: urls.join(',')                → 422 "type none or list expected, not str"
-  ❌ extras: createRecordUrl(APP_IDS.X, oneId)   // singular URL when list expected
-  ❌ extras: JSON.stringify(urls)
-Rule: if the form-state is a Set<id> or id[], map to URLs first, then pass the ARRAY directly.
-Scope: createRecordUrl builds the AUTHENTICATED /rest form. On public pages use
-recordRef(cfg, page, appId, recordId) from '@/lib/publicClient' instead — never createRecordUrl.
-"""
-)
-
-FORM_POLISH_PROMPT = """\
-# Form-Polish Sub-Agent — Aufgabenbeschreibung
-
-Du läufst im Sandbox-Build parallel zum Hauptagent. Der Hauptagent baut das
-Dashboard, du polierst die Formulare.
-
-Read `.placeholder-tasks.json` im Projekt-Root und befolge die folgenden Schritte
-für jede Entity im `tasks`-Array.
-
----
-
-## SCHRITT 0 — Analyse pro Entity (VOR jedem Write, laut denken)
-
-Schreibe für jede Entity 3–6 Sätze deutsche Analyse, beginnend mit
-"Analyse <Entity>:". Inhalt:
-
-- welche Number-Felder es gibt (Kandidaten für computed)
-- welche Lookup-/Applookup-Felder es gibt (Kandidaten für defaults + applookup())
-- welche Felder wirken berechenbar — z. B.
-  - "menge × preis_pro_einheit"
-  - "arbeitsstunden × stundensatz" (über applookup auf den Mitarbeiter)
-  - "tage × tagespreis" → `dateDiff(anreise, abreise, days) * applookup(zimmer, tagespreis)`
-  - "stunden × stundensatz" → `dateDiff(start, ende, hours) * applookup(mitarbeiter, stundensatz)`
-  - "summe + nebenkosten"
-
-**PFLICHT-CHECK bei zwei Datumsfeldern als Paar** (anreise/abreise, von/bis,
-start/ende, eingang/ausgang, ankunft/abreise).
-
-`a`, `b`, `c` sind UNABHÄNGIGE computed-Einträge — jeder bekommt seine eigene
-Zeile in `computed: { … }`. NIEMALS zusammenfassen, nie weglassen weil "der
-dateDiff steckt ja schon in der Gesamtkosten-Formel". Beispiel für eine
-Aufenthalts-Entity am Ende dieses Blocks zeigt alle drei gleichzeitig.
-
-### a) PFLICHT — Dauer-Berechnung (immer setzen, auch ohne Preis)
-
-Zwei mögliche Varianten — beide ggf. PARALLEL setzen, NICHT entweder/oder:
-
-**a.1) Wenn ein echtes Number-Feld für die Dauer existiert** (key/label enthält
-`naechte|nights|dauer|tage|days|anzahl_naechte|anzahl_tage|anzahl_stunden`):
-setze computed direkt auf diesen ECHTEN Key. Beispiel mit Feld `anzahl_naechte`:
-
-```
-'anzahl_naechte': 'dateDiff(checkin_datum, checkout_datum, days)'
-```
-
-Damit füllt sich der existierende Input automatisch — User sieht die Dauer
-DIREKT im richtigen Eingabefeld und kann notfalls überschreiben.
-
-**a.2) ZUSÄTZLICH (immer) — Virtueller Dauer-Key** für die Aggregat-Anzeige
-unten im Dialog. Key beginnt mit `_` und kommt NICHT in `fields` vor.
-**Schreibe Umlaute direkt im Key** (JS/TS/Vite unterstützen Unicode-Identifier
-nativ — `'_aufenthalt_dauer_nächte'` statt `'_aufenthalt_dauer_naechte'`).
-Der Label im Dialog wird aus dem Key abgeleitet, daher landen ASCII-Codings
-wie `ae`/`oe`/`ue` wörtlich in der UI ("Naechte" statt "Nächte"). Wert:
-gleicher dateDiff wie in (a.1):
-
-```
-'_aufenthalt_dauer_nächte': 'dateDiff(aufenthalt_ankunft, aufenthalt_abreise, days)'
-```
-
-Wenn KEIN echtes Dauer-Feld in (a.1) existiert, ist nur (a.2) Pflicht.
-Wenn ein echtes Dauer-Feld existiert, sind BEIDE Pflicht — sie zeigen den
-gleichen Wert an zwei Stellen (Input + Aggregat). Das ist gewollte
-Redundanz: das Aggregat erinnert den User auch dann an die Dauer, wenn er
-den Input bereits manuell überschrieben hat.
-
-### b) Wenn die Entity ZUSÄTZLICH einen applookup auf eine "preis"-/"satz"-Spalte hat
-
-(tagespreis, stundensatz, kosten_pro_tag), ist `dateDiff(from, to, unit) * applookup(...)`
-fast immer die richtige computed-Formel für ein Gesamtkosten-Feld. Das ist ein
-SEPARATER Eintrag — der virtuelle Dauer-Key aus (a) bleibt zusätzlich bestehen.
-
-### c) AUFENTHALTS-ENTITY-HEURISTIK (überstimmt Punkt b bei Namens-Match)
-
-Wenn der ENTITY-Name eines dieser Wörter enthält (case-insensitive) —
-`aufenthalt`, `buchung`, `reservierung`, `booking`, `stay`, `mietzeit`,
-`vermietung`, `kursteilnahme`, `teilnahme`, `anmeldung` — UND ein Datumspaar
-vorhanden ist UND ein Gesamtkosten-/Preis-Number-Feld existiert (key/label
-enthält "gesamt", "kosten", "preis", "summe", "betrag") UND ein applookup auf
-irgendein numerisches Preis-/Kosten-Feld existiert (Spalte muss NICHT
-"tagespreis" heißen — `preis`, `kosten`, `betrag`, `gebuehr` reichen) → setze
-IMMER:
-
-```
-'gesamtkosten_key': 'dateDiff(from, to, days) * applookup(lookup_key, preis_key)'
-```
-
-Begründung: Bei Aufenthalten/Buchungen ist die User-Erwartung IMMER Tage × Preis
-— auch wenn die Preis-Spalte semantisch mehrdeutig ist (Einzelpreis vs.
-Tagespreis). Lieber falsch multiplizieren als leere Berechnung. Der User
-korrigiert das Ergebnis im Number-Input manuell, falls nötig (clearing →
-restore computed).
-
-Schwache Begründungen wie "Leistungen optional", "Preis ist Einzelpreis" oder
-"nicht eindeutig" sind bei Aufenthalts-Entities VERBOTEN — die Formel wird
-trotzdem gesetzt.
-
-### VOLLSTÄNDIGES BEISPIEL für eine Buchungs-Entity mit echtem `anzahl_naechte`-Feld
-
-```ts
-computed: {
-  // (a.1) Echtes Anzahl-Nächte-Feld — füllt den Input automatisch
-  'anzahl_naechte':
-    'dateDiff(checkin_datum, checkout_datum, days)',
-  // (a.2) Virtueller Dauer-Key — Aggregat-Hinweis unten im Dialog
-  // (Umlaut DIREKT im Key — kein `naechte`, sondern `nächte`)
-  '_buchung_dauer_nächte':
-    'dateDiff(checkin_datum, checkout_datum, days)',
-  // (c) Gesamtpreis — Tage × Tagespreis (über applookup auf Zimmer)
-  'gesamtpreis':
-    'dateDiff(checkin_datum, checkout_datum, days) * applookup(zimmer, preis_pro_nacht)',
-}
-```
-
-Wenn keine echtes Dauer-Feld existiert (z. B. Aufenthalt ohne `anzahl_naechte`),
-entfällt nur (a.1) — (a.2) und (c) bleiben Pflicht.
-
-Alle drei Einträge sind unabhängig — der dateDiff in (c) ersetzt NICHT (a.1)/(a.2).
-
-### Abschluss der Analyse
-
-Liste am Ende: welche computed-Formeln du daraus planst — ODER warum du keine
-setzt (z. B. "reine Stammdaten, nichts berechenbar"). Erst NACH dieser Analyse
-mit Edits/Writes fortfahren. Ohne diese Analyse gilt die Entity als nicht
-bearbeitet.
-
----
-
-## AUFGABE 1 — Placeholders (für jedes Feld in `fields`)
-
-**WICHTIG: Du editierst KEINE Dialog-Dateien.** Du schreibst EINE einzige
-JSON-Datei mit deinen Placeholder-Vorschlägen; ein Node-Skript trägt sie nach
-deinem Lauf deterministisch in die Dialoge ein. Das ist schneller (1× Write
-statt 30× Edit) und robuster (keine Patch-Fehler durch TSX-Quote-Escaping).
-
-1. Für JEDES Feld in den `tasks[*].fields` einen kurzen, hilfreichen deutschen
-   Placeholder erfinden. Nutze `entity`, `entity_context`, `label` und ggf.
-   `target_entity` / `options` aus dem Feld-Objekt für Domain-Kontext. Max
-   4 Wörter (Textarea darf länger sein), kein Punkt am Ende, NIE das Label
-   wiederholen. Pflicht: applookup-Felder (Combobox) und date-Felder
-   (DatePicker) NIEMALS überspringen — sonst sehen User leere Slots.
-
-   Beispiele:
-   - input "Buchungsnummer" → `"z. B. BU-2026-001"`
-   - applookup mit target_entity "Mitarbeiter" → `"Mitarbeiter wählen"` oder
-     `"Aus 22 Mitarbeitern wählen"` wenn 'aus N' Sinn macht
-   - select mit options `["Vollzeit","Teilzeit","Minijob",…]` →
-     `"z. B. Vollzeit, Teilzeit"`
-   - date "Anreisedatum" → `"Wann kommt die Katze?"`
-   - textarea "Notizen" → `"Besonderheiten, Wünsche, Allergien..."`
-
-2. **EIN Write-Aufruf** auf `/home/user/app/.placeholder-suggestions.json`
-   mit ALLEN Vorschlägen. Format: Pro Eintrag in `tasks` ein Top-Level-Key
-   mit dem `file`-Basename (z. B. `"AufenthalteDialog.tsx"`), darunter ein
-   Map `{ key → placeholder-text }`.
-
-   Beispiel-Skelett (zeigt alle Feldtypen):
-   ```json
-   {
-     "ZimmerDialog.tsx": {
-       "zimmer_nummer":       "z. B. Z-101",
-       "zimmer_bezeichnung":  "z. B. Ruheraum Ost",
-       "zimmer_typ":          "Wähle einen Zimmertyp",
-       "zimmer_kapazitaet":   "z. B. 2",
-       "zimmer_beschreibung": "Ausstattung, Besonderheiten..."
-     },
-     "AufenthalteDialog.tsx": {
-       "aufenthalt_tier":         "Welches Tier kommt?",
-       "aufenthalt_zimmer":       "Welches Zimmer zuweisen?",
-       "aufenthalt_leistungen":   "Welche Leistung?",
-       "aufenthalt_ankunft":      "Wann kommt das Tier?",
-       "aufenthalt_abreise":      "Wann reist es ab?",
-       "aufenthalt_behandlung":   "Behandlung, Fütterung, Verhalten...",
-       "aufenthalt_gesamtkosten": "z. B. 234,50",
-       "aufenthalt_notizen":      "Spezielle Wünsche, Notizen..."
-     }
-   }
-   ```
-
-   Quote-Hinweis: Wert ist ein JSON-String. Verwende einfache Anführungszeichen
-   ('), keine doppelten ("). Der Apply-Script strippt doppelte Quotes
-   trotzdem als Sicherheit — kein Build-Bruch möglich.
-
----
-
-## AUFGABE 2 — Form-Enhancements (nur wenn `formEnhancements`-Feld vorhanden)
-
-Befolge die Heuristik unten für fieldOrder, defaults UND computed. Sei bei
-defaults großzügig (Datum=heute, Anzahl=1, Status=erster offener Eintrag, …).
-Schreibe die Datei unter `formEnhancements.configPath` mit Write vollständig
-neu. Format:
-
-```ts
-import type { FormEnhancements } from './types';
-
-export const formEnhancements: FormEnhancements = {
-  // fieldOrder-Einträge sind ENTWEDER Strings ODER { row: [...], cols?: '...' }-
-  // Objekte für Spalten-Layouts (PLZ+Ort, Vorname+Nachname, etc.). Der Python-
-  // Generator hat row-Pairs im Skeleton vorgesetzt — behandle sie als unteilbare
-  // Atoms: umsortieren OK, in einzelne Strings auflösen verboten.
-  fieldOrder: ['key1', { row: ['plz','ort'], cols: '1fr 2fr' }, 'key2', ...],
-  defaults: {
-    // type 'date/date' → ohne withTime
-    'datum':   { kind: 'today' },
-    // type 'date/datetimeminute' → withTime: true (sonst falsches Format!)
-    'anreise': { kind: 'today',       withTime: true },
-    'abreise': { kind: 'todayOffset', days: 3, withTime: true },
-    // KEIN literal-Default für `naechte` o.ä., wenn der Key in `computed` als
-    // dateDiff vorkommt — siehe Regel unten "computed schlägt default NICHT".
-    // 'naechte': { kind: 'literal', value: 1 },  ← FALSCH bei dateDiff-computed
-    'status':  { kind: 'lookup', key: 'offen', label: 'Offen' },
-  },
-  computed: {                                         // sei großzügig — lieber produzieren als weglassen
-    // MODUS 1: Formel als String — Standard, immer bevorzugen.
-    // Erlaubte Bausteine: field(key), applookup(ownKey, lookupKey),
-    // dateDiff(from, to, days|hours), bare Zahlen, + - * /, Klammern.
-    // Ein Build-Step parst die Strings vor `npm run build` zu Trees.
-    'mwst':        'field(netto) * 0.19',
-    'gesamtpreis': 'applookup(zimmer, tagespreis) * dateDiff(anreise, abreise, days) + applookup(zusatzleistung, preis)',
-    // MODUS 2: Inline-Funktion — NUR wenn Formel nicht reicht (Conditionals,
-    // Schleifen, Multi-Lookup-Summen, Lookup-Switches). Pure Funktion mit ctx-API.
-    // NUR ZAHLEN: computed berechnet Beträge/Anzahlen/Dauern, NIE ein Datum und
-    // nie einen Text — ein String-Return ist TS2322. Datums-Vorbelegung gehört
-    // in defaults ({ kind: 'todayOffset', days: n }).
-    //   FALSCH: 'faelligkeitsdatum': (_f, ctx) => `${y}-${m}-${d}`
-    //   RICHTIG: defaults: { 'faelligkeitsdatum': { kind: 'todayOffset', days: 30 } }
-    // Eigene Formularfelder IMMER über ctx.num(key) lesen — liefert number
-    // (fehlend/leer → 0). ctx.field(key) ist der Rohwert für String-Vergleiche;
-    // damit zu rechnen bricht den Build.
-    //   FALSCH: const netto = ctx.field('preis') ?? 0; return netto * 0.19;
-    //   RICHTIG: return ctx.num('preis') * 0.19;
-    // ctx.num/ctx.field lesen NUR echte Felder, KEINE anderen computed-Keys
-    // (die liefern 0) — Zwischenwerte in der Funktion selbst berechnen.
-    'gesamtpreis_mit_einheit': (fields, ctx) => {
-      const basis  = (ctx.applookup('zimmer','tagespreis') ?? 0)
-                   * (ctx.dateDiff('anreise','abreise') ?? 0);
-      const zPreis = ctx.applookup('zusatzleistung','preis') ?? 0;
-      const e      = ctx.applookupAny('zusatzleistung','preiseinheit');
-      const k      = (e && typeof e === 'object' && 'key' in e) ? (e as {key:string}).key : (typeof e === 'string' ? e : null);
-      const n      = ctx.dateDiff('anreise','abreise') ?? 0;
-      const zusatz = k === 'pro_tag'   ? zPreis * n
-                   : k === 'pro_woche' ? zPreis * (n / 7)
-                   :                     zPreis;     // einmalig / sonst
-      return basis + zusatz;
-    },
-  },
-};
-```
-
-Im Formel-Modus normale Mathematik: `*` und `/` binden stärker als `+` und `-`,
-Klammern zum Gruppieren erlaubt. Im Funktions-Modus DARF NUR `ctx.*` aufgerufen
-werden — kein fetch, kein localStorage, kein eval. Bei fehlenden Operanden
-returne `null` oder behandle als 0 — niemals NaN durchreichen.
-
----
-
-## GANZ AM ENDE (zwei Schritte, in dieser Reihenfolge)
-
-1. Schreibe `.form-polish-report.json` (mit Write-Tool, nicht Bash) im Format:
-
-```json
-{
-  "entities": {
-    "Auftraege": {
-      "placeholders_set":  9,
-      "defaults_keys":    ["auftragsdatum", "status", "arbeitsstunden"],
-      "computed_keys":    ["arbeitskosten", "summe_arbeiten", "gesamt"],
-      "reason":           "Stunden × Stundensatz (Applookup Mitarbeiter) + Material × Preis"
-    },
-    "Kunden": {
-      "placeholders_set":  9,
-      "defaults_keys":    [],
-      "computed_keys":    [],
-      "reason":           "Reine Stammdaten, nichts berechenbar"
-    }
-  }
-}
-```
-
-Eine Zeile pro Entity. `reason` ist Pflicht — bei leerem `computed_keys` MUSST
-du erklären warum (nichts berechenbar / keine Applookup-Kette / kein
-Numerikfeld …).
-
-2. ERST DANACH: `rm /home/user/app/.placeholder-tasks.json`
-
-Kurze Status-Antwort. Keine Re-Reads.
 """
 
-SUBAGENT_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep"]
-
-# ── Mechanical parallel fan-out for the intent pages ───────────────
-#
-# Four separate prose rules ordered the orchestrator to put every
-# intent_builder call into ONE response, one of them shouting "CRITICAL" and
-# quoting the measured cost. A live run still dispatched flow 2 only after
-# flow 1's result had come back — 133s + 114s, where the 114s was entirely
-# free wall-clock. Prose cannot fix this: response boundaries are the model's
-# to choose, and it chose wrong while being told not to.
-#
-# So the fan-out stops being a model decision. ONE tool call takes ALL flows
-# and runs them under asyncio.gather; `intent_builder` is no longer a
-# dispatchable subagent (a PreToolUse hook denies it), which leaves no serial
-# path to take. The guarantee is now our own control flow, not a rule.
-
-# A flow that hangs must not take the build with it. Phase 1 pages take
-# ~100-160s; 10 minutes is generous enough that only a genuinely stuck
-# session hits it, and the others still return.
-_INTENT_FLOW_TIMEOUT_S = 600
-
-
-def _emit(payload: dict) -> None:
-    print(json.dumps(payload), flush=True)
-
-
-# ── Stream-progress plumbing ─────────────────────────────────────────
-#
-# include_partial_messages makes the CLI forward the raw API stream events.
-# CAVEAT (live-proven): for large tool inputs this CLI build delivers the
-# partial_json deltas in a BURST shortly before the block completes, not as a
-# steady flow — a 2-minute Write shows as silence and then ~22k chars at once.
-# Silence is therefore AMBIGUOUS (big generation OR backoff), and the watchdog
-# text must not claim otherwise: a run generating 38k tokens over 9 minutes at
-# normal token speed was misread as rate-limit stalls because of that claim.
-# Two consumers:
-#   1. the stall watchdog — one line per 30s of silence, cause kept neutral.
-#   2. a throttled `progress` log line (chars generated so far), so the
-#      wall-clock of a large Write is visible while it happens.
-_PROGRESS_EVERY_S = 15
-
-# Shared by the main session and the fan-out page sessions (same process):
-# stream activity anywhere keeps the watchdog quiet.
-_LAST_EVENT = {"t": time.time()}
-
-
-def _mark_event() -> None:
-    _LAST_EVENT["t"] = time.time()
-
-
-def _stream_delta_chars(message) -> int | None:
-    """Generation progress (chars) carried by a stream event; None for every
-    non-stream message. Matched by type NAME — StreamEvent is not exported at
-    the SDK top level in every version this file runs against."""
-    if type(message).__name__ != "StreamEvent":
-        return None
-    try:
-        event = message.event or {}
-        if event.get("type") != "content_block_delta":
-            return 0
-        delta = event.get("delta") or {}
-        return len(delta.get("text") or delta.get("partial_json")
-                   or delta.get("thinking") or "")
-    except Exception:
-        return 0
-
-
-def _agent_options(**kwargs) -> ClaudeAgentOptions:
-    """ClaudeAgentOptions, minus any field this SDK build does not have.
-
-    The sandbox image and a local checkout do not necessarily install the same
-    SDK: `thinking` only exists from ~0.1.2x on, while `max_thinking_tokens` is
-    the older spelling. Passing an unknown field is a hard TypeError, so the
-    keys are filtered against the dataclass instead of assumed — otherwise the
-    fan-out is untestable anywhere but inside the image it ships in.
-    """
-    supported = {f.name for f in dataclasses.fields(ClaudeAgentOptions)}
-    return ClaudeAgentOptions(**{k: v for k, v in kwargs.items() if k in supported})
-
-
-async def _build_one_intent_page(flow: dict, index: int) -> dict:
-    """Run ONE intent-page session to completion. Never raises — a failure is
-    reported back to the orchestrator as data so the other flows still land."""
-    file_path = str(flow.get("file", "")).strip()
-    brief = str(flow.get("brief", "")).strip()
-    tag = file_path.rsplit("/", 1)[-1] or f"flow{index}"
-    started = time.time()
-
-    if not file_path or not brief:
-        return {"file": file_path, "ok": False, "seconds": 0.0,
-                "error": "flow entry needs both 'file' and 'brief'"}
-
-    _emit({"type": "tool", "tool": "IntentPage", "tool_use_id": f"intent:{tag}",
-           "input": f"build {file_path}", "t": round(started - _t0, 1),
-           "model": AGENT_MODEL, "actor": "main", "parent_id": None})
-
-    options = _agent_options(
-        # preset + append mirrors how the CLI composed the old AgentDefinition:
-        # base tool behaviour stays, INTENT_BUILDER_PROMPT rides on top.
-        system_prompt={"type": "preset", "preset": "claude_code",
-                       "append": INTENT_BUILDER_PROMPT},
-        allowed_tools=SUBAGENT_TOOLS,
-        # allowed_tools does NOT block the built-in subagent dispatch: a live
-        # page session spawned an Explore agent to read SKILL.md + types and
-        # then read both files again itself (~20s + tokens, and a second
-        # serialization path through the back door). Deny it by name — the
-        # dispatch tool has been called both Task and Agent across CLI
-        # versions.
-        disallowed_tools=["Agent", "Task"],
-        # Raw stream events for the progress plumbing (see _stream_delta_chars).
-        include_partial_messages=True,
-        # Same as the orchestrator session — the old subagents inherited this.
-        thinking={"type": "disabled"},
-        # The intent-ui skill lives in .claude/skills — without the project
-        # source the session cannot find it and starts guessing contracts.
-        setting_sources=["project"],
-        permission_mode="bypassPermissions",
-        cwd="/home/user/app",
-        model=AGENT_MODEL,
-    )
-
-    texts: list[str] = []
-    try:
-        # The SDK terminates the CLI subprocess in a `finally` inside its
-        # generator, so on timeout that generator must be closed, not abandoned.
-        # CPython's refcounting does close it promptly here (verified: removing
-        # aclosing does NOT fail the test below), so this is hardening, not a
-        # fix for an observed leak — it stops the cleanup from depending on
-        # refcount timing, which a traceback holding the frame alive, or a
-        # non-refcounting runtime, would break.
-        async with asyncio.timeout(_INTENT_FLOW_TIMEOUT_S), aclosing(
-            sdk_query(prompt=f"Build the file `{file_path}`.\n\n{brief}", options=options)
-        ) as session:
-            prog = {"chars": 0, "last": started}
-            async for message in session:
-                chars = _stream_delta_chars(message)
-                if chars is not None:
-                    _mark_event()
-                    prog["chars"] += chars
-                    now = time.time()
-                    if prog["chars"] and now - prog["last"] >= _PROGRESS_EVERY_S:
-                        prog["last"] = now
-                        _emit({"type": "progress", "tool": "IntentPage",
-                               "tool_use_id": f"intent:{tag}",
-                               "chars": prog["chars"],
-                               "t": round(now - _t0, 1),
-                               "actor": "subagent", "parent_id": f"intent:{tag}"})
-                    continue
-                if not isinstance(message, AssistantMessage):
-                    continue
-                _mark_event()
-                prog["chars"] = 0
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock):
-                        _emit({"type": "tool", "tool": block.name,
-                               "tool_use_id": block.id,
-                               "input": str(block.input)[:2000],
-                               "t": round(time.time() - _t0, 1),
-                               "model": AGENT_MODEL,
-                               "actor": "subagent", "parent_id": f"intent:{tag}"})
-                    elif isinstance(block, TextBlock):
-                        texts.append(block.text)
-    except TimeoutError:
-        return {"file": file_path, "ok": False,
-                "seconds": round(time.time() - started, 1),
-                "error": f"timed out after {_INTENT_FLOW_TIMEOUT_S}s"}
-    except Exception as e:
-        return {"file": file_path, "ok": False,
-                "seconds": round(time.time() - started, 1),
-                "error": f"{type(e).__name__}: {e}"}
-
-    seconds = round(time.time() - started, 1)
-    _emit({"type": "tool_result", "tool": "IntentPage",
-           "tool_use_id": f"intent:{tag}",
-           "output": f"{file_path} done in {seconds}s",
-           "t": round(time.time() - _t0, 1),
-           "actor": "main", "parent_id": None})
-    return {"file": file_path, "ok": True, "seconds": seconds,
-            "summary": ("\n".join(texts))[-1500:]}
-
-
-@tool(
-    "build_intent_pages",
-    "Build EVERY intent flow page. Pass all flows in this ONE call — they run "
-    "concurrently, so the wall-clock is the slowest page, not their sum. "
-    "Each entry: {file: 'src/pages/intents/XPage.tsx', brief: '<the full brief>'}. "
-    "There is no other way to create intent pages.",
-    {
-        "type": "object",
-        "properties": {
-            "flows": {
-                # Live-proven repeatedly (this branch's 408s Handwerk-Pro run,
-                # and twice on actions-on-build): the orchestrator stringifies
-                # the array despite any description telling it not to, and the
-                # schema rejection costs ~30s per attempt — the 408s run spent
-                # ~350s debugging around it. Accept the string and parse it in
-                # the handler — tolerating beats re-prompting.
-                "type": ["array", "string"],
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "file": {"type": "string",
-                                 "description": "src/pages/intents/{PascalCase}Page.tsx"},
-                        "brief": {"type": "string",
-                                  "description": "The complete brief for this one page."},
-                    },
-                    "required": ["file", "brief"],
-                },
-            }
-        },
-        "required": ["flows"],
-    },
-)
-async def _build_intent_pages(args: dict) -> dict:
-    flows = args.get("flows") or []
-    if isinstance(flows, str):
-        # The schema admits a JSON-encoded string (see the schema comment).
-        try:
-            flows = json.loads(flows)
-        except ValueError:
-            flows = []
-        if not isinstance(flows, list):
-            flows = []
-        flows = [f for f in flows if isinstance(f, dict)]
-    if not isinstance(flows, list) or not flows:
-        return {"content": [{"type": "text", "text": "No flows given — pass one entry per intent page."}],
-                "is_error": True}
-
-    batch_started = time.time()
-    print(f"[KLAR] Intent fan-out: {len(flows)} page(s) in parallel", flush=True)
-
-    results = await asyncio.gather(
-        *(_build_one_intent_page(flow, i) for i, flow in enumerate(flows))
-    )
-
-    total = round(time.time() - batch_started, 1)
-    slowest = max((r["seconds"] for r in results), default=0.0)
-    serial = round(sum(r["seconds"] for r in results), 1)
-    print(f"[KLAR] Intent fan-out done: {total}s wall-clock "
-          f"(slowest page {slowest}s, serial would have been {serial}s)", flush=True)
-
-    lines = [f"{len(flows)} intent page(s) built in {total}s (parallel).", ""]
-    for r in results:
-        if r["ok"]:
-            lines.append(f"OK  {r['file']}  ({r['seconds']}s)")
-        else:
-            lines.append(f"FAILED  {r['file']}  ({r['seconds']}s): {r['error']}")
-    if any(not r["ok"] for r in results):
-        lines += ["", "A failed page does NOT exist on disk. Do not wire it — either call this",
-                  "tool again with just that flow, or drop it and wire only the pages that built."]
-    lines += ["", "Next: wire each page that built with scripts/wire-intent.mjs, then `node scripts/heal-tsc.mjs && node scripts/i18n-tx.mjs wrap && npm run build` (heal-tsc mechanically fixes the missing-.fields.-prefix, raw-vs-Enriched and ??-null-in-payload classes; fix only what it prints below its JSON report)."]
-    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
-
+SUBAGENT_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
 # ── System prompt variants ──────────────────────────────────────────
 
@@ -806,15 +128,15 @@ async def _build_intent_pages(args: dict) -> dict:
 SYSTEM_APPEND_DASHBOARD = (
     "MANDATORY RULES (highest priority):\n"
     "- No design_brief.md — analyze data in 1-2 sentences, then implement directly\n"
-    "- DashboardOverview.tsx: Call Read('src/pages/DashboardOverview.tsx') FIRST, then Write ONCE with complete content. Never read back after writing. Keep the DashboardSkeleton/DashboardError import (@/components/DashboardStates) and the two early-returns — never re-implement them.\n"
+    "- DashboardOverview.tsx: Call Read('src/pages/DashboardOverview.tsx') FIRST, then Write ONCE with complete content. Never read back after writing.\n"
     "- NEVER use Bash for file operations (no cat, echo, heredoc, >, >>). ALWAYS use Read/Write/Edit tools. If a tool fails, retry with the SAME tool — never fall back to Bash.\n"
     "- index.css: NEVER touch — pre-generated design system (font, colors, sidebar). Use existing tokens.\n"
     "- Layout.tsx: APP_TITLE is pre-set to the appgroup name. Do NOT edit unless you need a different title.\n"
     "- CRUD pages/dialogs: NEVER touch — complete with all logic\n"
     "- App.tsx, PageShell.tsx, StatCard.tsx, ConfirmDialog.tsx: NEVER touch\n"
-    "- No Read-back after Write/Edit. A gate/tsc error is the exception: repair the flagged LINES with Edit (they are quoted for you) — never re-Write the whole file\n"
-    "- No Read of files whose contents are in .scaffold_context or the .scaffold_files_p* parts\n"
-    "- Read .scaffold_context FIRST, then each .scaffold_files_p* part it lists (one Read each) to understand all generated files\n"
+    "- No Read-back after Write/Edit\n"
+    "- No Read of files whose contents are in .scaffold_context\n"
+    "- Read .scaffold_context FIRST to understand all generated files\n"
     "- useDashboardData.ts, enriched.ts, enrich.ts, formatters.ts, ai.ts, ChatWidget.tsx: NEVER touch — use as-is\n"
     "- src/config/ai-features.ts: MAY edit — set AI_PHOTO_SCAN['Entity'] = true to enable photo scan in dialogs\n"
     "- Rules of Hooks: ALL hooks (useState, useEffect, useMemo, useCallback) MUST be BEFORE any early returns (loading/error). Never place a hook after 'if (loading) return' or 'if (error) return'.\n"
@@ -842,26 +164,17 @@ async def main():
     # Build phase support for two-phase builds
     build_phase = os.getenv('BUILD_PHASE', 'all')  # "dashboard", "intents", or "all"
 
-    # Subagent definitions. form_polish is registered in every phase (also
-    # "dashboard") so the main-agent can dispatch it via subagent_type="form_polish"
-    # without having to read a prompt file from disk. intent_builder is only
-    # needed when the build includes the intents phase.
-    agents = {
-        "form_polish": AgentDefinition(
-            description="Polishes generated CRUD forms: fills placeholder=\"\" with helpful hints, writes per-entity formEnhancements configs (fieldOrder, defaults, computed formulas), and produces .form-polish-report.json. Runs from .placeholder-tasks.json as task list.",
-            prompt=FORM_POLISH_PROMPT,
-            tools=SUBAGENT_TOOLS,
-            model="haiku",
-        ),
-    }
-    # NOTE: there is deliberately no `intent_builder` AgentDefinition. Intent
-    # pages are built by the build_intent_pages tool below, which fans out with
-    # asyncio.gather — see the comment there for why a rule was not enough.
-    mcp_servers = {}
+    # Subagent definitions — only needed for phases that use orchestration
+    agents = None
     if build_phase in ("intents", "all"):
-        mcp_servers["klar"] = create_sdk_mcp_server(
-            name="klar", version="1.0.0", tools=[_build_intent_pages]
-        )
+        agents = {
+            "intent_builder": AgentDefinition(
+                description="Builds one intent-specific UI page from scratch. Give it the file path to create and the intent description.",
+                prompt=INTENT_BUILDER_PROMPT,
+                tools=SUBAGENT_TOOLS,
+                model="inherit",
+            ),
+        }
 
     # Select system prompt based on build phase
     if build_phase == "dashboard":
@@ -871,10 +184,6 @@ async def main():
 
     options = ClaudeAgentOptions(
         hooks={
-            "PreToolUse": [
-                HookMatcher(matcher="Read", hooks=[_block_subagent_files_for_main_agent], timeout=10),
-                HookMatcher(matcher=None, hooks=[_deny_serial_intent_dispatch], timeout=10),
-            ],
             "PostToolUse": [HookMatcher(matcher=None, hooks=[_on_post_tool_use], timeout=60)],
         },
         system_prompt={
@@ -887,30 +196,16 @@ async def main():
         permission_mode="bypassPermissions",
         disallowed_tools=["TodoWrite", "NotebookEdit", "WebFetch", "ExitPlanMode", "SlashCommand"],
         cwd="/home/user/app",
-        model=AGENT_MODEL,
+        model="claude-sonnet-4-6",
     )
 
-    options.agents = agents
-    # Raw stream events for the progress plumbing (see _stream_delta_chars).
-    # Guarded like _agent_options: an image with an older SDK just runs
-    # without streaming (and the watchdog says so in its [WAIT] text).
-    if any(f.name == "include_partial_messages"
-           for f in dataclasses.fields(ClaudeAgentOptions)):
-        options.include_partial_messages = True
-    if mcp_servers:
-        options.mcp_servers = mcp_servers
+    # Only register agents when needed (Phase 2 / all)
+    if agents:
+        options.agents = agents
 
     # Session-Resume Unterstützung
     # BUG: agents + resume crashes the Claude CLI (tested SDK 0.1.50 + 0.1.58).
-    # When `form_polish` runs as a formal AgentDefinition in Phase 1, the JSONL
-    # contains `subagent_type="form_polish"` tool-use blocks. On resume the CLI
-    # replays those blocks and tries to resolve the agent — if we drop `agents`,
-    # the type lookup fails inside __aenter__ and the SDK crashes before any of
-    # our code runs.
-    #
-    # The reverse trade-off works: keep agents registered, drop the resume.
-    # Phase 2 then starts as a fresh session (no Phase-1 conversation history),
-    # but the agent registry stays consistent and `intent_builder` can still run.
+    # Skip resume when agents are registered — Phase 2 doesn't need conversation history.
     resume_session_id = os.getenv('RESUME_SESSION_ID')
     if agents and resume_session_id:
         print(f"[KLAR] Skipping resume (agents + resume = SDK crash)")
@@ -979,7 +274,7 @@ Starte JETZT mit Schritt 1!"""
     elif build_phase == "dashboard":
         # Phase 1: Identical to actions branch — direct agent, no orchestrator overhead
         query = (
-            "Read .scaffold_context (plus the .scaffold_files_p* parts it lists, one Read each) and app_metadata.json. "
+            "Read .scaffold_context and app_metadata.json. "
             "Analyze data, decide UI paradigm in 1-2 sentences, then implement directly. "
             "Follow .claude/skills/frontend-impl/SKILL.md. "
             "Use existing types and services from src/types/ and src/services/. "
@@ -1068,52 +363,51 @@ SKIP intent UIs when: \
 Only proceed if there is at least ONE workflow that genuinely \
 cannot fit in the dashboard because of its complexity. \
 \
-**IF SKIPPING:** The sidebar currently shows ghost rows ("Abläufe — werden erstellt …"). \
+**IF SKIPPING:** The dashboard currently shows WorkflowPlaceholders (loading skeletons). \
 You MUST clean them up before stopping: \
-1. Run `node scripts/wire-intent.mjs --no-flows` — it flips INTENTS_PENDING to false, \
-   which removes the ghost rows (do NOT edit src/config/intents.ts by hand) \
+1. Edit src/App.tsx — remove the WorkflowPlaceholders import and replace \
+   `<><div className="mb-8"><WorkflowPlaceholders /></div><DashboardOverview /></>` \
+   with just `<DashboardOverview />` \
 2. Run 'npm run build' and STOP.
 
-2. IF intent UIs are justified, call the tool `build_intent_pages` ONCE with every flow in its \
-`flows` array — one entry per page, `{file, brief}`. The pages are built concurrently, so the cost \
-is the slowest page instead of their sum. There is no 'intent_builder' subagent; dispatching one \
-is denied. Per flow:
+2. IF intent UIs are justified, DISPATCH 'intent_builder' subagents IN PARALLEL (in a single response) for each intent:
    - File path: src/pages/intents/{PascalCaseName}Page.tsx
    - DETAILED step-by-step description: what are the STEPS of the workflow, which entities are touched \
 in each step, what records get created/updated, what live feedback to show between steps
-   - For EVERY selection step: WHICH records are eligible. That is your decision, not the user's — \
-a close-an-order flow that lists already-closed orders lets them be closed twice. Name the filter, \
-or say explicitly that all records qualify and why.
-   - COPY VERBATIM from .entity_summary: module paths, service method names, the `!` required markers, \
-applookup target app_ids, and the lookup keys listed after a lookup field's type \
-([lookup/select: a|b|c]) — a step that writes or filters a lookup field gets its exact keys \
-in the brief. Those are verified facts and quoting them is the point of that file.
-   - NOTHING ELSE. The page builder Reads `.claude/skills/intent-ui/SKILL.md` before it \
-writes any code, so it already owns the block contracts (IntentWizardShell, EntitySelectStep, \
-BudgetTracker, StatusBadge), the no-{Entity}Dialog rule, the lookup-write form and the import style — \
-from a source that is maintained, unlike your memory of it. Never name a type, helper or path you did \
-not read in .entity_summary: a brief that told the builder to import `EnrichedKunden` named a type \
-that does not exist.
-   - KEEP EACH BRIEF UNDER ~350 WORDS: file path, one-sentence goal, the steps (eligible records \
-with exact keys, fields as name![type: keys], service calls with app_ids), the module-paths block. \
-No "German UI" reminders, no date/hook/import rules, no required-fields recap — the ! markers \
-already carry it. A measured run spent ~40s just generating two briefs.
+   - Tell it to USE these pre-generated shared components (already available, no need to rebuild):
+     * IntentWizardShell from '@/components/IntentWizardShell' — wizard container with step indicator, \
+deep-linking (?step=N), loading/error. Props: steps, currentStep, onStepChange, loading, error, children. \
+Each step must provide its own action/navigation buttons — the shell does NOT render back/next buttons.
+     * EntitySelectStep from '@/components/EntitySelectStep' — reusable "pick an item" step with search. \
+Props: items (id, title, subtitle, status, stats), onSelect
+     * BudgetTracker from '@/components/BudgetTracker' — budget progress bar. Props: budget, booked
+     * StatusBadge from '@/components/StatusBadge' — universal status badge. Props: statusKey, label
+   - Tell it to import types, APP_IDS, LivingAppsService, extractRecordId, createRecordUrl from the scaffold
+   - Remind: lookup fields when WRITING use plain string keys, NOT {key, label} objects
+   - CRITICAL: Tell it which {Entity}Dialog components exist and MUST be used for record creation. \
+List ALL available dialogs by name (e.g., "ArtikelDialog from '@/components/dialogs/ArtikelDialog'") \
+and their list props (e.g., "einkaufsgruppeList={einkaufsgruppe}"). \
+The intent builder MUST use these dialogs for creating new records — NEVER build inline forms. \
+Every step that involves selecting a record must ALSO show a "Neu erstellen" button opening the dialog.
 
 DO NOT dispatch 'dashboard_builder'.
 
-3. After build_intent_pages returns (it reports OK/FAILED per page):
-   - Wire EACH flow with the script — one call per flow, do NOT edit src/App.tsx or
-     src/config/intents.ts by hand:
-       node scripts/wire-intent.mjs {PascalCaseName}Page {slug} '{1-3 words in the UI language}' {IconX} '{one line}'
-     It adds the lazy import + route to App.tsx, the icon import + registry entry to
-     src/config/intents.ts (the sidebar "Abläufe" section renders from that registry; do NOT
-     add navigation cards to the dashboard) and flips INTENTS_PENDING to false — that swaps
-     the sidebar's ghost rows for your real entries. Pick a fitting Tabler icon (COMPONENT
-     name like IconCalendarPlus). If the script fails it names the exact problem — fix that
-     and re-run; never edit outside the marker blocks, everything else is scaffold.
+3. After ALL intent_builder subagents complete:
+   - Edit src/App.tsx to:
+     * Remove the WorkflowPlaceholders import and its usage from the index route
+     * Add lazy imports and routes for the new intent pages
+     * CRITICAL: Keep ALL existing imports, providers (ActionsProvider), wrappers (ErrorBoundary), and route structure intact — only ADD intent routes and remove WorkflowPlaceholders
+   - Read src/pages/DashboardOverview.tsx, then Edit it to ADD a workflow navigation section \
+at the TOP of the dashboard (before other content):
+     * NO section header or title — just the cards directly
+     * Cards with LEFT accent border (border-l-4 border-primary) + icon + title + description + IconChevronRight arrow
+     * Each card is a clickable <a href="#/intents/{slug}"> link
+     * Cards: bg-card border border-border rounded-xl p-4 shadow-sm hover:shadow-md transition-shadow
    - Run 'npm run build', fix any TypeScript errors, keep fixing until build succeeds
 
-4. After 'npm run build' succeeds, STOP immediately."""
+4. After 'npm run build' succeeds, STOP immediately.
+
+CRITICAL: Dispatch ALL intent_builder subagents in a SINGLE response for maximum parallelism."""
 
         print(f"[KLAR] Phase 2: Intents-only build")
 
@@ -1186,48 +480,44 @@ SKIP intent UIs when: \
 Only proceed with intent UIs if there is at least ONE workflow that genuinely \
 cannot fit in the dashboard because of its complexity. \
 \
-**IF SKIPPING:** The sidebar currently shows ghost rows ("Abläufe — werden erstellt …"). \
+**IF SKIPPING:** The dashboard currently shows WorkflowPlaceholders (loading skeletons). \
 You MUST clean them up before stopping: \
-1. Run `node scripts/wire-intent.mjs --no-flows` — it flips INTENTS_PENDING to false, \
-   which removes the ghost rows (do NOT edit src/config/intents.ts by hand) \
+1. Edit src/App.tsx — remove the WorkflowPlaceholders import and replace \
+   `<><div className="mb-8"><WorkflowPlaceholders /></div><DashboardOverview /></>` \
+   with just `<DashboardOverview />` \
 2. Run 'npm run build' and STOP.
 
-2. IF intent UIs are justified, call the tool `build_intent_pages` ONCE with every flow in its \
-`flows` array — one entry per page, `{file, brief}`. The pages are built concurrently, so the cost \
-is the slowest page instead of their sum. There is no 'intent_builder' subagent; dispatching one \
-is denied.
-   a) For EACH intent, one `flows` entry with:
+2. IF intent UIs are justified, DISPATCH ALL SUBAGENTS IN PARALLEL (in a single response):
+   a) For EACH intent, dispatch 'intent_builder' with:
       - File path: src/pages/intents/{PascalCaseName}Page.tsx
       - DETAILED step-by-step description: what are the STEPS of the workflow, which entities are touched \
 in each step, what records get created/updated, what live feedback to show between steps
-      - For EVERY selection step: WHICH records are eligible. That is your decision, not the user's — \
-a close-an-order flow that lists already-closed orders lets them be closed twice. Name the filter, \
-or say explicitly that all records qualify and why.
-      - COPY VERBATIM from .entity_summary: module paths, service method names, the `!` required markers, \
-applookup target app_ids, and the lookup keys listed after a lookup field's type \
-([lookup/select: a|b|c]) — a step that writes or filters a lookup field gets its exact keys \
-in the brief. Those are verified facts and quoting them is the point of that file.
-      - NOTHING ELSE. The page builder Reads `.claude/skills/intent-ui/SKILL.md` before \
-it writes any code, so it already owns the block contracts (IntentWizardShell, EntitySelectStep, \
-BudgetTracker, StatusBadge), the no-{Entity}Dialog rule, the lookup-write form and the import style — \
-from a source that is maintained, unlike your memory of it. Never name a type, helper or path you did \
-not read in .entity_summary: a brief that told the builder to import `EnrichedKunden` named a type \
-that does not exist.
-      - KEEP EACH BRIEF UNDER ~350 WORDS: file path, one-sentence goal, the steps (eligible records \
-with exact keys, fields as name![type: keys], service calls with app_ids), the module-paths block. \
-No "German UI" reminders, no date/hook/import rules, no required-fields recap — the ! markers \
-already carry it. A measured run spent ~40s just generating two briefs.
+      - Tell it to USE these pre-generated shared components (already available, no need to rebuild):
+        * IntentWizardShell from '@/components/IntentWizardShell' — wizard container with step indicator, \
+deep-linking (?step=N), loading/error. Props: steps, currentStep, onStepChange, loading, error, children. \
+Each step must provide its own action/navigation buttons — the shell does NOT render back/next buttons.
+        * EntitySelectStep from '@/components/EntitySelectStep' — reusable "pick an item" step with search. \
+Props: items (id, title, subtitle, status, stats), onSelect
+        * BudgetTracker from '@/components/BudgetTracker' — budget progress bar. Props: budget, booked
+        * StatusBadge from '@/components/StatusBadge' — universal status badge. Props: statusKey, label
+      - Tell it to import types, APP_IDS, LivingAppsService, extractRecordId, createRecordUrl from the scaffold
+      - Remind: lookup fields when WRITING use plain string keys, NOT {key, label} objects
+      - CRITICAL: Tell it which {Entity}Dialog components exist and MUST be used for record creation. \
+List ALL available dialogs by name and their list props. \
+The intent builder MUST use these dialogs — NEVER inline forms. \
+Every step that involves selecting a record must ALSO show a "Neu erstellen" button opening the dialog.
 
-3. After build_intent_pages returns (it reports OK/FAILED per page):
-   - Wire EACH flow with the script — one call per flow, do NOT edit src/App.tsx or
-     src/config/intents.ts by hand:
-       node scripts/wire-intent.mjs {PascalCaseName}Page {slug} '{1-3 words in the UI language}' {IconX} '{one line}'
-     It adds the lazy import + route to App.tsx, the icon import + registry entry to
-     src/config/intents.ts (the sidebar "Abläufe" section renders from that registry; do NOT
-     add navigation cards to the dashboard) and flips INTENTS_PENDING to false — that swaps
-     the sidebar's ghost rows for your real entries. Pick a fitting Tabler icon (COMPONENT
-     name like IconCalendarPlus). If the script fails it names the exact problem — fix that
-     and re-run; never edit outside the marker blocks, everything else is scaffold.
+3. After ALL subagents complete:
+   - Edit src/App.tsx to:
+     * Remove the WorkflowPlaceholders import and its usage from the index route
+     * Add lazy imports and routes for the new intent pages
+     * CRITICAL: Keep ALL existing imports, providers (ActionsProvider), wrappers (ErrorBoundary), and route structure intact — only ADD intent routes and remove WorkflowPlaceholders
+   - Read src/pages/DashboardOverview.tsx, then Edit it to ADD a workflow navigation section \
+at the TOP of the dashboard (before other content):
+     * NO section header or title — just the cards directly
+     * Cards with LEFT accent border (border-l-4 border-primary) + icon + title + description + IconChevronRight arrow
+     * Each card is a clickable <a href="#/intents/{slug}"> link
+     * Cards: bg-card border border-border rounded-xl p-4 shadow-sm hover:shadow-md transition-shadow
    - Run 'npm run build', fix any TypeScript errors, keep fixing until build succeeds
 
 4. After 'npm run build' succeeds, STOP immediately.
@@ -1252,76 +542,26 @@ CRITICAL: Dispatch ALL subagents in a SINGLE response for maximum parallelism.""
 
         t_last_step = t_agent_total_start
 
-        # Stall watchdog: the SDK retries rate-limited API calls silently, so
-        # a 429-backoff looks like a multi-minute hole in the stream. One
-        # line per 30s of silence makes the wait visible as it happens.
-        # With streaming enabled, generation keeps _LAST_EVENT fresh (deltas
-        # arrive continuously), so a [WAIT] is a REAL stall — the text says
-        # which of the two worlds this build runs in.
-        _mark_event()
-
-        async def _stall_watchdog():
-            reported = 0.0
-            while True:
-                await asyncio.sleep(15)
-                silent = time.time() - _LAST_EVENT["t"]
-                if silent >= 30 and silent >= reported + 30:
-                    reported = silent
-                    # Deliberately neutral: this CLI build delivers partial_json
-                    # deltas of big tool inputs as an end-of-block burst, so
-                    # silence here usually IS a large generation in progress
-                    # (see the stream-progress plumbing note above).
-                    print(
-                        f"[WAIT] {round(silent)}s ohne Stream-Event — meist eine große Generierung (Tool-Input-Deltas kommen gebündelt), sonst Rate-Limit-Backoff",
-                        flush=True,
-                    )
-                elif silent < 30:
-                    reported = 0.0
-
-        watchdog = asyncio.create_task(_stall_watchdog())
-        main_prog = {"chars": 0, "last": time.time()}
-
         async for message in client.receive_response():
             now = time.time()
-            _mark_event()
-
-            # Stream deltas: feed the watchdog + throttled progress line, but
-            # do NOT touch t_last_step — `dt` keeps meaning "time since the
-            # previous REAL event", which is the number used to spot expensive
-            # single tool calls in the log.
-            chars = _stream_delta_chars(message)
-            if chars is not None:
-                main_prog["chars"] += chars
-                if main_prog["chars"] and now - main_prog["last"] >= _PROGRESS_EVERY_S:
-                    main_prog["last"] = now
-                    print(json.dumps({
-                        "type": "progress", "chars": main_prog["chars"],
-                        "t": round(now - t_agent_total_start, 1),
-                        **_actor_fields(getattr(message, "parent_tool_use_id", None)),
-                    }), flush=True)
-                continue
-
             elapsed = round(now - t_agent_total_start, 1)
             dt = round(now - t_last_step, 1)
             t_last_step = now
 
             if isinstance(message, AssistantMessage):
-                main_prog["chars"] = 0
-                actor = _actor_fields(message.parent_tool_use_id)
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        print(json.dumps({"type": "think", "content": block.text, "t": elapsed, "dt": dt, "model": message.model, **actor}), flush=True)
+                        print(json.dumps({"type": "think", "content": block.text, "t": elapsed, "dt": dt}), flush=True)
 
                     elif isinstance(block, ToolUseBlock):
-                        print(json.dumps({"type": "tool", "tool": block.name, "tool_use_id": block.id, "input": str(block.input), "t": elapsed, "dt": dt, "model": message.model, **actor}), flush=True)
+                        print(json.dumps({"type": "tool", "tool": block.name, "input": str(block.input), "t": elapsed, "dt": dt}), flush=True)
 
             elif isinstance(message, UserMessage):
                 if isinstance(message.content, list):
-                    actor = _actor_fields(message.parent_tool_use_id)
                     for block in message.content:
                         if isinstance(block, ToolResultBlock) and _LOG_LEVEL == "debug":
                             content = str(block.content)[:4000] if block.content else ""
-                            print(json.dumps({"type": "tool_result", "tool_use_id": block.tool_use_id, "output": content, "is_error": block.is_error, "t": elapsed, **actor}), flush=True)
+                            print(json.dumps({"type": "tool_result", "tool_use_id": block.tool_use_id, "output": content, "is_error": block.is_error, "t": elapsed}), flush=True)
 
             elif isinstance(message, ResultMessage):
                 status = "success" if not message.is_error else "error"
@@ -1341,13 +581,8 @@ CRITICAL: Dispatch ALL subagents in a SINGLE response for maximum parallelism.""
                     "status": status,
                     "cost": message.total_cost_usd,
                     "session_id": message.session_id,
-                    "duration_s": round(t_agent_total, 1),
-                    # cache_read vs cache_creation vs input tells whether prompt
-                    # caching carried the resumed history or every turn paid full
-                    "usage": getattr(message, "usage", None)
+                    "duration_s": round(t_agent_total, 1)
                 }), flush=True)
-
-        watchdog.cancel()
 
 if __name__ == "__main__":
     import sys
